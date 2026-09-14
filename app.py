@@ -2,49 +2,103 @@ from flask import Flask, request, Response, jsonify
 import subprocess
 import os
 import sys
+import traceback
+import yt_dlp
 
 app = Flask(__name__)
 
-current_track = {"title": "Chưa phát bài nào", "status": "idle"}
-
-def get_youtube_stream_info(query):
-    try:
-        cmd = [
-            sys.executable, "-m", "yt_dlp",
-            f"ytsearch1:{query}",
-            "--get-title",
-            "--get-url",
-            "-f", "bestaudio/ba",
-            "--no-warnings"
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-        if res.returncode == 0:
-            lines = res.stdout.strip().split("\n")
-            if len(lines) >= 2:
-                return lines[0].strip(), lines[1].strip()
-    except Exception as e:
-        print(f"Lỗi tìm kiếm: {e}")
-    return None, None
+current_track = {"title": "Chua phat", "status": "idle"}
 
 @app.route("/")
 def index():
-    return "🎵 Xiaozhi AI YouTube Music Cloud Server 24/7 is Running!"
+    return "Xiaozhi AI YouTube Music Cloud Server 24/7 is Running!"
+
+@app.route("/debug")
+def debug():
+    q = request.args.get("q", "son tung").strip()
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'default_search': 'ytsearch1',
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{q}", download=False)
+            if 'entries' in info and len(info['entries']) > 0:
+                entry = info['entries'][0]
+                return jsonify({
+                    'status': 'ok',
+                    'title': entry.get('title'),
+                    'url': entry.get('url'),
+                    'formats_count': len(entry.get('formats', []))
+                })
+            else:
+                return jsonify({'status': 'no_entries', 'info': str(info)[:300]})
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+@app.route("/play")
+def play():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "Thieu query"}), 400
+    
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'default_search': 'ytsearch1',
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{q}", download=False)
+            if 'entries' in info and len(info['entries']) > 0:
+                entry = info['entries'][0]
+                title = entry.get('title', q)
+                return jsonify({"title": title, "stream_url": f"/stream?q={q}"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+        
+    return jsonify({"error": "Khong tim thay"}), 404
 
 @app.route("/stream")
 def stream_music():
     q = request.args.get("q", "").strip()
     if not q:
-        return "Thiếu tên bài hát (?q=...)", 400
+        return "Thieu ten bai hat", 400
 
-    title, audio_url = get_youtube_stream_info(q)
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'default_search': 'ytsearch1',
+    }
+    audio_url = None
+    title = q
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{q}", download=False)
+            if 'entries' in info and len(info['entries']) > 0:
+                entry = info['entries'][0]
+                title = entry.get('title', q)
+                audio_url = entry.get('url')
+    except Exception as e:
+        return f"Loi tim kiem: {e}", 500
+
     if not audio_url:
-        return "Không tìm thấy bài hát", 404
+        return "Khong tim thay audio stream", 404
 
-    print(f"[*] Đang phát: {title}")
     current_track["title"] = title
     current_track["status"] = "playing"
 
-    # Transcode audio to 24000Hz mono MP3 128kbps matching ESP32 AudioCodec exactly
     ffmpeg_cmd = [
         "ffmpeg",
         "-reconnect", "1",
@@ -78,16 +132,6 @@ def stream_music():
         "X-Song-Title": title.encode("ascii", "ignore").decode("ascii")
     }
     return Response(generate(), headers=headers)
-
-@app.route("/play")
-def play():
-    q = request.args.get("q", "").strip()
-    if not q:
-        return jsonify({"error": "Thiếu query"}), 400
-    title, url = get_youtube_stream_info(q)
-    if not url:
-        return jsonify({"error": "Không tìm thấy bài hát"}), 404
-    return jsonify({"title": title, "stream_url": f"/stream?q={q}"})
 
 @app.route("/status")
 def status():
