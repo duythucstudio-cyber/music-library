@@ -72,9 +72,8 @@ def stream_music():
     current_track["title"] = title
     current_track["status"] = "playing"
     current_track["source"] = source
-    app.logger.info(f"Playing [{source}]: {title}")
+    app.logger.info(f"Playing [{source}]: {title} | URL: {audio_url[:80]}...")
 
-    # Transcode to 24000Hz mono MP3 96kbps for ESP32 AudioCodec
     ffmpeg_cmd = [
         "ffmpeg",
         "-reconnect", "1",
@@ -89,15 +88,17 @@ def stream_music():
         "pipe:1"
     ]
 
-    process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=4096)
+    process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=2048)
 
     def generate():
         try:
             while True:
-                chunk = process.stdout.read(4096)
+                chunk = process.stdout.read(2048)
                 if not chunk:
                     break
                 yield chunk
+        except Exception as err:
+            app.logger.error(f"Stream exception: {err}")
         finally:
             try:
                 process.kill()
@@ -105,15 +106,13 @@ def stream_music():
                 pass
             current_track["status"] = "idle"
 
-    headers = {
-        "Content-Type": "audio/mpeg",
-        "Transfer-Encoding": "chunked",
-        "X-Song-Title": title.encode("ascii", "ignore").decode("ascii"),
-        "X-Song-Source": source
-    }
-    return Response(generate(), headers=headers)
+    # NOTE: DO NOT set Transfer-Encoding header manually in WSGI; Werkzeug handles chunked transfer automatically
+    resp = Response(generate(), mimetype="audio/mpeg")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Song-Title"] = title.encode("ascii", "ignore").decode("ascii")
+    resp.headers["X-Song-Source"] = source
+    return resp
 
-# Keep-alive background thread so Render free instance never goes to sleep
 def keep_alive_worker():
     time.sleep(60)
     my_url = os.environ.get("RENDER_EXTERNAL_URL", "https://esp32-music-server-9not.onrender.com")
