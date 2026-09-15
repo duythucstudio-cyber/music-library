@@ -2,103 +2,79 @@ from flask import Flask, request, Response, jsonify
 import subprocess
 import os
 import sys
-import traceback
-import yt_dlp
+import time
+import threading
+import urllib.request
+import logging
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-current_track = {"title": "Chua phat", "status": "idle"}
+current_track = {"title": "Chưa phát bài nào", "status": "idle", "source": "none"}
+
+def search_stream(query):
+    # Try 1: YouTube with android client
+    cmd_yt = [
+        sys.executable, "-m", "yt_dlp",
+        f"ytsearch1:{query}",
+        "--extractor-args", "youtube:player_client=android",
+        "--get-title", "--get-url",
+        "-f", "bestaudio/ba",
+        "--no-warnings"
+    ]
+    try:
+        res = subprocess.run(cmd_yt, capture_output=True, text=True, timeout=12)
+        if res.returncode == 0:
+            lines = res.stdout.strip().split("\n")
+            if len(lines) >= 2 and lines[1].strip().startswith("http"):
+                return lines[0].strip(), lines[1].strip(), "youtube"
+    except Exception as e:
+        app.logger.warning(f"YouTube search error: {e}")
+
+    # Try 2: SoundCloud search (extremely reliable on cloud datacenter IPs)
+    cmd_sc = [
+        sys.executable, "-m", "yt_dlp",
+        f"scsearch1:{query}",
+        "--get-title", "--get-url",
+        "-f", "bestaudio",
+        "--no-warnings"
+    ]
+    try:
+        res = subprocess.run(cmd_sc, capture_output=True, text=True, timeout=12)
+        if res.returncode == 0:
+            lines = res.stdout.strip().split("\n")
+            if len(lines) >= 2 and lines[1].strip().startswith("http"):
+                return lines[0].strip(), lines[1].strip(), "soundcloud"
+    except Exception as e:
+        app.logger.warning(f"SoundCloud search error: {e}")
+
+    return None, None, None
 
 @app.route("/")
 def index():
-    return "Xiaozhi AI YouTube Music Cloud Server 24/7 is Running!"
+    return "🎵 Xiaozhi AI Music Cloud Server is Running 24/7!"
 
-@app.route("/debug")
-def debug():
-    q = request.args.get("q", "son tung").strip()
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'default_search': 'ytsearch1',
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{q}", download=False)
-            if 'entries' in info and len(info['entries']) > 0:
-                entry = info['entries'][0]
-                return jsonify({
-                    'status': 'ok',
-                    'title': entry.get('title'),
-                    'url': entry.get('url'),
-                    'formats_count': len(entry.get('formats', []))
-                })
-            else:
-                return jsonify({'status': 'no_entries', 'info': str(info)[:300]})
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }), 500
-
-@app.route("/play")
-def play():
-    q = request.args.get("q", "").strip()
-    if not q:
-        return jsonify({"error": "Thieu query"}), 400
-    
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'default_search': 'ytsearch1',
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{q}", download=False)
-            if 'entries' in info and len(info['entries']) > 0:
-                entry = info['entries'][0]
-                title = entry.get('title', q)
-                return jsonify({"title": title, "stream_url": f"/stream?q={q}"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-        
-    return jsonify({"error": "Khong tim thay"}), 404
+@app.route("/status")
+def status():
+    return jsonify(current_track)
 
 @app.route("/stream")
 def stream_music():
     q = request.args.get("q", "").strip()
     if not q:
-        return "Thieu ten bai hat", 400
+        return "Thiếu tên bài hát (?q=...)", 400
 
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'default_search': 'ytsearch1',
-    }
-    audio_url = None
-    title = q
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{q}", download=False)
-            if 'entries' in info and len(info['entries']) > 0:
-                entry = info['entries'][0]
-                title = entry.get('title', q)
-                audio_url = entry.get('url')
-    except Exception as e:
-        return f"Loi tim kiem: {e}", 500
-
+    app.logger.info(f"Search request: {q}")
+    title, audio_url, source = search_stream(q)
     if not audio_url:
-        return "Khong tim thay audio stream", 404
+        return f"Không tìm thấy bài hát: {q}", 404
 
     current_track["title"] = title
     current_track["status"] = "playing"
+    current_track["source"] = source
+    app.logger.info(f"Playing [{source}]: {title}")
 
+    # Transcode to 24000Hz mono MP3 96kbps for ESP32 AudioCodec
     ffmpeg_cmd = [
         "ffmpeg",
         "-reconnect", "1",
@@ -107,7 +83,7 @@ def stream_music():
         "-i", audio_url,
         "-vn",
         "-f", "mp3",
-        "-ab", "128k",
+        "-ab", "96k",
         "-ar", "24000",
         "-ac", "1",
         "pipe:1"
@@ -123,19 +99,33 @@ def stream_music():
                     break
                 yield chunk
         finally:
-            process.kill()
+            try:
+                process.kill()
+            except Exception:
+                pass
             current_track["status"] = "idle"
 
     headers = {
         "Content-Type": "audio/mpeg",
         "Transfer-Encoding": "chunked",
-        "X-Song-Title": title.encode("ascii", "ignore").decode("ascii")
+        "X-Song-Title": title.encode("ascii", "ignore").decode("ascii"),
+        "X-Song-Source": source
     }
     return Response(generate(), headers=headers)
 
-@app.route("/status")
-def status():
-    return jsonify(current_track)
+# Keep-alive background thread so Render free instance never goes to sleep
+def keep_alive_worker():
+    time.sleep(60)
+    my_url = os.environ.get("RENDER_EXTERNAL_URL", "https://esp32-music-server-9not.onrender.com")
+    while True:
+        try:
+            time.sleep(600)
+            urllib.request.urlopen(my_url, timeout=10)
+            app.logger.info("Keep-alive ping sent successfully")
+        except Exception as e:
+            app.logger.warning(f"Keep-alive ping failed: {e}")
+
+threading.Thread(target=keep_alive_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
